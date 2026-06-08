@@ -1,7 +1,7 @@
 # Inkplate 6 Plus E-Reader Plan
 
 ## Context
-Build a functional e-book reader on the Inkplate 6 Plus using PlatformIO + Arduino framework. The device has no touchscreen, so navigation uses 3 physical buttons wired to the onboard MCP23017-1 IO expander (GPB1–GPB3). Books are stored as plain `.txt` files on a microSD card. The goal for v1 is: power on → browse library → read a book → page turn with buttons → resume position on next boot.
+Build a functional e-book reader on the Inkplate 6 Plus using PlatformIO + Arduino framework. Navigation uses the built-in capacitive touchscreen (tap zones) plus the onboard Wake button (GPIO36) — no external hardware needed. Books are stored as plain `.txt` files on a microSD card. The goal for v1 is: power on → browse library → read a book → page turn with taps → resume position on next boot.
 
 ---
 
@@ -11,7 +11,7 @@ e-reader/
 ├── platformio.ini
 └── src/
     ├── main.cpp              — state machine + setup/loop
-    ├── ButtonHandler.h/cpp   — MCP23017 button polling, debounce, input lockout
+    ├── InputHandler.h/cpp    — touchscreen tap zones + Wake button (GPIO36), debounce, input lockout
     ├── Library.h/cpp         — SD card .txt file listing + selection
     ├── BookReader.h/cpp      — text pagination engine (lazy SD streaming)
     ├── BookmarkManager.h/cpp — save/load page position to SD + RTC reconciliation
@@ -35,13 +35,29 @@ monitor_speed = 115200
 
 ## Components
 
-### 1. ButtonHandler
-- 3 buttons on MCP23017-1 PORTB: **GPB1** (Prev), **GPB2** (Next), **GPB3** (Menu)
-- Wiring: button connects pin to GND; `INPUT_PULLUP` via `inkplate.pinModeInternal()`
-- Read via `inkplate.digitalReadInternal()` — polled in main loop
-- Software debounce: ignore re-triggers within 200ms
-- **Input lockout:** ignore all button input for 500ms after wake or display init to prevent phantom presses during re-initialization
-- **No repeat on hold** in v1 — one press = one action
+### 1. InputHandler
+Navigation uses the built-in touchscreen + the Wake button (GPIO36). No external wiring needed.
+
+**Touchscreen tap zones (STATE_READING):**
+- Tap left 40% of screen → Previous page
+- Tap right 40% of screen → Next page
+- Tap center 20% → ignored (accidental touch buffer)
+
+**Touchscreen tap zones (STATE_LIBRARY):**
+- Tap upper half of list item → scroll up
+- Tap lower half of list item → scroll down
+- Tap on a title → open book
+
+**Wake button (GPIO36):**
+- Short press (< 500ms) → Menu / confirm
+- Long press (≥ 500ms) → Back to library from anywhere
+- Wakes device from deep sleep (via `esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0)`)
+
+**Implementation:**
+- Poll `inkplate.touchInArea()` or raw `inkplate.tsGetData()` in main loop
+- Debounce: ignore re-triggers within 200ms of last touch
+- **Input lockout:** ignore all input for 500ms after wake or display init
+- Wake button read via `digitalRead(36)` with a timestamp to distinguish short/long press
 
 ### 2. Library
 - On boot, scan SD root for all `.txt` files; store filenames in `String[]` (cap 50)
@@ -93,11 +109,11 @@ Three views driven by a state enum:
 **`STATE_SLEEP_WARNING`** *(new)*
 - Triggered when battery < 3.6V or idle timer reaches 4min 30s (30s warning before 5min sleep)
 - Partial refresh overlay: "Battery low — sleeping soon" or "Sleeping in 30s…"
-- Any button press during this 30s window resets the idle timer and returns to reading
+- Any touch or Wake button press during this 30s window resets the idle timer and returns to reading
 - If no press: flush bookmark to SD, render sleep screen, enter deep sleep
 
 **Sleep screen** *(rendered before deep sleep)*
-- Clears to a simple centered message: book title + "Tap any button to wake"
+- Clears to a simple centered message: book title + "Press Wake to resume"
 - This replaces the reading page so the user can visually distinguish a sleeping device
 
 ### 6. Display Strategy
@@ -108,28 +124,30 @@ Three views driven by a state enum:
 
 ---
 
-## Button Wiring Diagram
+## Input Layout
 
-**Use MCP23017 GPB pins — not direct ESP32 GPIO.** The second MCP23017's pins are broken out on the board edge specifically for user expansion; most ESP32 GPIO pins are consumed by the display driver.
+No external wiring required — all inputs are built into the board.
 
 ```
-MCP23017-1 (second expander, all pins broken out on board edge)
-
-  GPB1 ──[button]── GND    ← Previous page / scroll up
-  GPB2 ──[button]── GND    ← Next page / scroll down
-  GPB3 ──[button]── GND    ← Menu / confirm
-  (INPUT_PULLUP — no external resistor needed)
-
-  INTB ──────────────────── ESP32 free GPIO   ← deep sleep wake source
+┌─────────────────────────────────────┐
+│                                     │
+│   TAP LEFT        TAP RIGHT         │
+│   (Prev page)     (Next page)       │
+│                                     │
+│         [center buffer zone]        │
+│                                     │
+└─────────────────────────────────────┘
+         [WAKE BUTTON - GPIO36]
+         short press = Menu / confirm
+         long press  = Back to Library
+         any press   = wake from sleep
 ```
 
-Use `INTB` (not INTA) — buttons are on PORTB. INTA monitors PORTA (display internals).
+Deep sleep wake via `esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0)` — Wake button pulls GPIO36 low.
 
-Code:
-```cpp
-inkplate.pinModeInternal(MCP23017_INT_ADDR, inkplate.ioExpanderForward, 1, INPUT_PULLUP);
-int state = inkplate.digitalReadInternal(MCP23017_INT_ADDR, inkplate.ioExpanderForward, 1);
-```
+Touchscreen read via `inkplate.tsGetData()` — returns touch coordinates; map X position to left/right zones.
+
+Also update STATE_MENU navigation: tap top half of option = up, tap bottom half = down, Wake button = confirm.
 
 ---
 
@@ -202,7 +220,7 @@ buttonHandler.lockInput(500);        // discard first 500ms of input
 ## Build Order (incremental, each step is independently testable)
 
 1. **Scaffold** — `platformio.ini` + `main.cpp` initializes Inkplate, displays "Hello" on screen. Confirms toolchain.
-2. **Buttons** — Wire 3 buttons, poll in loop, `Serial.print` on each press. Confirms MCP23017 reads + debounce.
+2. **Input** — Poll touchscreen tap zones + Wake button (GPIO36). Serial.print on each detected input. Confirms touch coordinates map correctly to left/right/wake actions.
 3. **SD + Library view** — Scan for `.txt` files, render list, navigate with Prev/Next, select with Menu. Test error + empty states.
 4. **BookReader** — Open file, paginate, render page 1, page-turn. Test last page → library transition. Test ghost refresh counter.
 5. **Bookmarks** — Save/load per book. Test RTC vs SD reconciliation.
@@ -214,7 +232,7 @@ buttonHandler.lockInput(500);        // discard first 500ms of input
 ## Verification Steps (per milestone)
 
 - **M1:** Text on display, no compile errors
-- **M2:** Serial shows correct button name; no false triggers; no double-fires within 200ms
+- **M2:** Serial shows "PREV", "NEXT", or "MENU" on correct tap zones and Wake button; no false triggers within 200ms debounce window
 - **M3:** File list renders; selection moves; empty/no-SD error states display correctly
 - **M4:** Full book navigable; last page returns to library; page 10+ shows no ghosting (full refresh fired)
 - **M5:** Close book, reopen → same page; kill power mid-chapter, reopen → SD bookmark page loads
