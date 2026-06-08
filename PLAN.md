@@ -10,12 +10,12 @@ Build a functional e-book reader on the Inkplate 6 Plus using PlatformIO + Ardui
 e-reader/
 ├── platformio.ini
 └── src/
-    ├── main.cpp            — state machine + setup/loop
-    ├── ButtonHandler.h/cpp — MCP23017 button polling + debounce
-    ├── Library.h/cpp       — SD card .txt file listing + selection
-    ├── BookReader.h/cpp    — text pagination engine (lazy SD streaming)
-    ├── BookmarkManager.h/cpp — save/load page position to SD
-    └── UI.h/cpp            — screen rendering for both views
+    ├── main.cpp              — state machine + setup/loop
+    ├── ButtonHandler.h/cpp   — MCP23017 button polling, debounce, input lockout
+    ├── Library.h/cpp         — SD card .txt file listing + selection
+    ├── BookReader.h/cpp      — text pagination engine (lazy SD streaming)
+    ├── BookmarkManager.h/cpp — save/load page position to SD + RTC reconciliation
+    └── UI.h/cpp              — screen rendering for all views + sleep screen
 ```
 
 ---
@@ -31,128 +31,201 @@ lib_deps =
 monitor_speed = 115200
 ```
 
-The official PlatformIO Inkplate library lives at:
-https://github.com/SolderedElectronics/Inkplate-Platformio-Library
-
 ---
 
 ## Components
 
 ### 1. ButtonHandler
-- 3 buttons wired to MCP23017-1 PORTB pins: **GPB1** (Prev), **GPB2** (Next), **GPB3** (Menu)
-- Wiring: button connects pin to GND; use `INPUT_PULLUP` via `inkplate.pinModeInternal()`
-- Read via `inkplate.digitalReadInternal()` — poll in main loop
+- 3 buttons on MCP23017-1 PORTB: **GPB1** (Prev), **GPB2** (Next), **GPB3** (Menu)
+- Wiring: button connects pin to GND; `INPUT_PULLUP` via `inkplate.pinModeInternal()`
+- Read via `inkplate.digitalReadInternal()` — polled in main loop
 - Software debounce: ignore re-triggers within 200ms
+- **Input lockout:** ignore all button input for 500ms after wake or display init to prevent phantom presses during re-initialization
+- **No repeat on hold** in v1 — one press = one action
 
 ### 2. Library
-- On boot, scan SD root for all `.txt` files
-- Store filenames in a `String[]` array (cap at 50 books)
-- Render as a scrollable list on screen; highlight selected entry
-- Prev/Next scroll the list; Menu opens the selected book
+- On boot, scan SD root for all `.txt` files; store filenames in `String[]` (cap 50)
+- Render as scrollable list; highlight selected entry
+- Prev/Next scroll the list; Menu opens selected book
+- **Error state:** if SD card is missing or unreadable, display "No SD card found. Please insert a card with .txt books." and halt
+- **Empty state:** if SD has no `.txt` files, display "No books found. Copy .txt files to your SD card."
+- **Filename display:** strip `.txt` extension, replace `_` and `-` with spaces, truncate to 40 chars
 
 ### 3. BookReader
 - **Never load the full file into RAM** — stream from SD line by line
-- On first open: scan through file recording byte offsets of each page boundary → store as `uint32_t pageOffsets[]`
-- Render current page: seek to `pageOffsets[currentPage]`, read lines until page is full
-- Word-wrap using Inkplate's GFX `getTextBounds()` to fit display width (1024px)
-- Leave margin: 40px left/right, 30px top/bottom
-- Font: use Inkplate's built-in `Fonts/FreeMono9pt7b` or similar for readability
+- On first open: scan file recording byte offsets of page boundaries → `uint32_t pageOffsets[]` (max 1000 pages = 4KB RAM)
+- Render current page: seek to `pageOffsets[currentPage]`, read lines until page full
+- Word-wrap using GFX `getTextBounds()` to fit 1024px width with 40px left/right margins, 30px top/bottom
+- Font: `Fonts/FreeSerif9pt7b` (proportional, more book-like than monospace)
+- **Page boundary behavior:**
+  - Next on last page → display "End of book" message for 2s → return to STATE_LIBRARY
+  - Prev on first page → no-op (do nothing)
+- **Ghost mitigation:** force a full refresh every 10 page turns; counter resets on full refresh
 
 ### 4. BookmarkManager
-- File: `/bookmarks.txt` on SD root, format: `filename.txt=42\n` (one line per book)
-- On book open: load saved page number if present
-- On page turn and on Menu press: write updated position back to SD
+- File: `/bookmarks.txt` on SD, one line per book: `filename.txt=42`
+- On book open: prefer RTC value if it matches current book; fall back to SD bookmark
+- **Save triggers:** every page turn, every state transition out of STATE_READING, and explicitly before any sleep entry (including low-battery sleep)
+- **RTC vs SD reconciliation on cold boot** (battery died, RTC wiped): load from SD bookmark; if no SD entry exists, start from page 0
 
 ### 5. UI
-Two views driven by a state enum in `main.cpp`:
-- **`STATE_LIBRARY`**: file list, selected index highlighted, renders on full refresh
-- **`STATE_READING`**: current page text, book title + page number in footer
-- **`STATE_MENU`** (minimal v1): shown on Menu press during reading — single option "Back to Library"
+Three views driven by a state enum:
+
+**`STATE_LIBRARY`**
+- Full refresh on entry
+- Scrollable filename list, selected entry highlighted
+- Footer: "X books" count
+
+**`STATE_READING`**
+- Full refresh on book open; partial refresh on page turns
+- Footer: `[book title]  page X / Y  [battery bar]`
+- Battery bar: 4-segment icon updated on each page turn
+
+**`STATE_MENU`**
+- Opened with Menu button during STATE_READING; **partial refresh** (not full)
+- Options (navigated with Prev/Next, selected with Menu):
+  1. Resume reading ← default selection, also what Menu re-press does
+  2. Back to library
+- Prev/Next move highlight up/down through options
+- Menu confirms selection
+- Re-pressing Menu with "Resume reading" highlighted (or pressing nothing for 30s) closes menu and returns to reading with no action
+
+**`STATE_SLEEP_WARNING`** *(new)*
+- Triggered when battery < 3.6V or idle timer reaches 4min 30s (30s warning before 5min sleep)
+- Partial refresh overlay: "Battery low — sleeping soon" or "Sleeping in 30s…"
+- Any button press during this 30s window resets the idle timer and returns to reading
+- If no press: flush bookmark to SD, render sleep screen, enter deep sleep
+
+**Sleep screen** *(rendered before deep sleep)*
+- Clears to a simple centered message: book title + "Tap any button to wake"
+- This replaces the reading page so the user can visually distinguish a sleeping device
 
 ### 6. Display Strategy
-- Use **1-bit mode** (black/white) for fastest page refresh and sharpest text
-- Full refresh on view transitions (library ↔ reading)
-- Partial refresh (`display.partialUpdate()`) on page turns to reduce flicker
-- Display: 1024 × 758 px
+- 1-bit mode (black/white) for sharpest text and fastest refresh
+- Full refresh: state transitions (library ↔ reading), first page of book, every 10th page turn
+- Partial refresh: page turns within a book, menu open/close
+- `partialUpdateCounter` tracked in `main.cpp`; resets on any full refresh
 
 ---
 
 ## Button Wiring Diagram
 
-**Use MCP23017 GPB pins — not direct ESP32 GPIO.** The Inkplate 6 Plus breaks out all 16 pins of a secondary MCP23017 along the board edge specifically for user expansion. Most ESP32 GPIO pins are consumed by the e-paper display driver, making them unavailable.
+**Use MCP23017 GPB pins — not direct ESP32 GPIO.** The second MCP23017's pins are broken out on the board edge specifically for user expansion; most ESP32 GPIO pins are consumed by the display driver.
 
 ```
 MCP23017-1 (second expander, all pins broken out on board edge)
 
-  GPB1 ──[button]── GND    ← Previous page
-  GPB2 ──[button]── GND    ← Next page
-  GPB3 ──[button]── GND    ← Menu
+  GPB1 ──[button]── GND    ← Previous page / scroll up
+  GPB2 ──[button]── GND    ← Next page / scroll down
+  GPB3 ──[button]── GND    ← Menu / confirm
   (INPUT_PULLUP — no external resistor needed)
+
+  INTB ──────────────────── ESP32 free GPIO   ← deep sleep wake source
 ```
 
-Code uses Inkplate library wrappers (not bare Arduino calls):
+Use `INTB` (not INTA) — buttons are on PORTB. INTA monitors PORTA (display internals).
+
+Code:
 ```cpp
 inkplate.pinModeInternal(MCP23017_INT_ADDR, inkplate.ioExpanderForward, 1, INPUT_PULLUP);
 int state = inkplate.digitalReadInternal(MCP23017_INT_ADDR, inkplate.ioExpanderForward, 1);
 ```
 
-For deep sleep wake: connect MCP23017 INT pin to one free ESP32 GPIO and use `esp_sleep_enable_ext0_wakeup()`.
-
 ---
 
 ## Sleep / Wake (Battery Power)
 
-E-paper retains its image without power — the ESP32 can deep sleep between page turns with no visible change to the display.
-
-**Sleep sequence:**
+### Boot path detection
+On every `setup()` entry, check wake cause first:
 ```cpp
-inkplate.einkOff();                              // panel off, image stays
-inkplate.setIntPin(BTN_PREV, FALLING);           // any button triggers MCP INT
-esp_sleep_enable_ext0_wakeup(MCP_INT_PIN, 0);   // MCP INT → one ESP32 GPIO
-esp_deep_sleep_start();                          // ~10µA draw
+esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+    // woke from deep sleep — restore from RTC_DATA_ATTR
+} else {
+    // fresh power-on — go to STATE_LIBRARY
+}
 ```
 
-**Wake sequence (runs from top of `setup()` on wake):**
+### Three distinct boot paths
+| Situation | RTC state | Action |
+|---|---|---|
+| Fresh power-on | irrelevant | → STATE_LIBRARY |
+| Wake from deep sleep | valid | → restore book + page from RTC |
+| Wake after battery died | wiped | → load from SD bookmark, → STATE_LIBRARY |
+
+### Sleep sequence
 ```cpp
-// Check esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0
+bookmarkManager.saveToDisk();        // always flush to SD before sleep
+UI.renderSleepScreen();              // "tap any button to wake" + book title
+inkplate.einkOff();                  // panel off, image retained
+inkplate.setIntPin(GPB1, FALLING);   // INTB fires on any button press
+inkplate.setIntPin(GPB2, FALLING);
+inkplate.setIntPin(GPB3, FALLING);
+esp_sleep_enable_ext0_wakeup(INTB_PIN, 0);
+esp_deep_sleep_start();              // ~10µA
+```
+
+### Wake sequence
+```cpp
+// In setup(), after detecting ESP_SLEEP_WAKEUP_EXT0:
 inkplate.begin();
 inkplate.einkOn();
-// restore state from RTC memory or SD bookmark
+buttonHandler.lockInput(500);        // discard first 500ms of input
+// restore state — no button action registered for the wake press
 ```
 
-**Battery monitoring** via `inkplate.readBattery()` (returns voltage as `double`):
-- LiPo range: 3.3V (empty) → 4.2V (full)
-- Show battery bar in reading footer, updated on each page turn
-- Auto-sleep immediately with low-battery message when voltage < 3.5V
-- Auto-sleep after **5 minutes** of no button presses
+**Wake convention:** the button press that wakes the device is consumed silently. The device restores the last page and waits. The user's next deliberate press is the first action. This is consistent with how Kindle and Kobo behave.
 
-**RTC memory:** Store current book filename + page number in `RTC_DATA_ATTR` variables so they survive deep sleep without an SD read on every wake.
+### Battery monitoring
+- `readBattery()` returns voltage as `double` (LiPo: 3.3V empty → 4.2V full)
+- Checked on every page turn
+- < 3.6V → enter STATE_SLEEP_WARNING ("Battery low — sleeping soon")
+- < 3.3V → force sleep immediately with no warning (too low to display safely)
+- Battery bar in reading footer: 4 segments, updated each page turn
+
+### Idle timer
+- Resets on every button press
+- At 4min 30s: enter STATE_SLEEP_WARNING ("Sleeping in 30s…")
+- Any press during warning: reset timer, return to STATE_READING
+- At 5min: sleep
+
+---
+
+## SD Card Handling
+
+- Mount SD on boot; if mount fails → STATE_LIBRARY with error message, no further SD ops
+- Unmount SD cleanly before entering deep sleep to prevent corruption
+- Re-mount on wake before any SD read
 
 ---
 
 ## Build Order (incremental, each step is independently testable)
 
-1. **Scaffold** — `platformio.ini` + `main.cpp` that initializes Inkplate and prints "Hello" to display. Confirms toolchain and library work.
-2. **Buttons** — Wire 3 buttons, poll in loop, Serial.print on each press. Confirms hardware wiring + MCP23017 reads.
-3. **SD + Library view** — Scan for .txt files, render list on screen, navigate with Prev/Next, select with Menu.
-4. **BookReader** — Open selected file, build page offsets, render page 1, page-turn with Prev/Next.
-5. **Bookmarks** — Save/load position; position restores correctly on reopen.
-6. **Sleep/Wake** — Auto-sleep after 5min inactivity; any button wakes and resumes. Battery indicator in footer. Low-battery forced sleep.
+1. **Scaffold** — `platformio.ini` + `main.cpp` initializes Inkplate, displays "Hello" on screen. Confirms toolchain.
+2. **Buttons** — Wire 3 buttons, poll in loop, `Serial.print` on each press. Confirms MCP23017 reads + debounce.
+3. **SD + Library view** — Scan for `.txt` files, render list, navigate with Prev/Next, select with Menu. Test error + empty states.
+4. **BookReader** — Open file, paginate, render page 1, page-turn. Test last page → library transition. Test ghost refresh counter.
+5. **Bookmarks** — Save/load per book. Test RTC vs SD reconciliation.
+6. **Sleep/Wake** — Auto-sleep + sleep screen. Wake restores correctly. Test double-press is not felt by user. Test low-battery path.
+7. **Battery UI** — Footer battery bar. Sleep warning state. Low-battery forced sleep.
 
 ---
 
 ## Verification Steps (per milestone)
 
-- Milestone 1: Text appears on display, no compile errors
-- Milestone 2: Serial monitor shows correct button name on press, no false triggers
-- Milestone 3: All .txt filenames render in list; selection highlight moves correctly
-- Milestone 4: Full book navigable page by page; last page doesn't crash
-- Milestone 5: Close book, reopen → lands on saved page
-- Milestone 6: 5min idle → display shows "sleeping…" → button press wakes device
+- **M1:** Text on display, no compile errors
+- **M2:** Serial shows correct button name; no false triggers; no double-fires within 200ms
+- **M3:** File list renders; selection moves; empty/no-SD error states display correctly
+- **M4:** Full book navigable; last page returns to library; page 10+ shows no ghosting (full refresh fired)
+- **M5:** Close book, reopen → same page; kill power mid-chapter, reopen → SD bookmark page loads
+- **M6:** 5min idle → sleep screen renders → button wakes → reading resumes; first post-wake press is the action, not the wake
+- **M7:** Battery bar updates each page turn; warning shows at 4:30; low-voltage forces sleep with bookmark saved
 
 ---
 
-## v2 Notes (out of scope for now)
-- Native EPUB parsing (ZIP + HTML strip) — likely needs pre-processing script on PC side
+## v2 Notes (out of scope for v1)
+- Native EPUB parsing (ZIP + HTML strip via PC-side Calibre conversion for now)
 - Font size selection via Menu
 - WiFi OTA book download
+- Button hold-repeat for fast library scrolling
+- Charging detection / "Charging" display state
