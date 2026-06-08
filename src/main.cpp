@@ -1,16 +1,16 @@
 #include <Inkplate.h>
 #include <SdFat.h>
 
-// --- Display constants ---
-#define SCREEN_W        1024
-#define SCREEN_H        758
+// --- Display constants (portrait: 758w x 1024h) ---
+#define SCREEN_W        758
+#define SCREEN_H        1024
 #define MARGIN_X        40
 #define MARGIN_Y        30
 #define FOOTER_H        40
 #define LINE_H          36   // px per library list row
 #define MAX_BOOKS       50
-#define LEFT_ZONE       410
-#define RIGHT_ZONE      614
+#define LEFT_ZONE       303  // 0-302 = left 40% of 758px
+#define RIGHT_ZONE      454  // 455-757 = right 40%
 #define POST_ACTION_MS  150
 
 Inkplate inkplate(INKPLATE_1BIT);
@@ -112,6 +112,7 @@ void drawLibrary() {
 void setup() {
     Serial.begin(115200);
     inkplate.begin();
+    inkplate.setRotation(1);  // portrait mode (758 x 1024)
     inkplate.tsInit(1);
 
     // Show loading message
