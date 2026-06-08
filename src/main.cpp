@@ -400,55 +400,89 @@ void setup() {
     drawLibrary();
 }
 
-void loop() {
-    unsigned long now = millis();
-    if (now - lastActionMs < POST_ACTION_MS) { delay(10); return; }
-    if (!inkplate.tsAvailable())             { delay(10); return; }
+// ── Gesture tracking ──────────────────────────────────────────────────────────
+#define SWIPE_THRESHOLD   100  // min px of vertical travel to count as a swipe
+#define TAP_MAX_DRIFT      60  // max px of total travel to count as a tap
 
-    uint16_t x[2], y[2];
-    uint8_t n = inkplate.tsGetData(x, y);
-    if (n == 0) return;
+static bool     touchActive = false;
+static uint16_t touchStartX = 0, touchStartY = 0;
+static uint16_t touchLastX  = 0, touchLastY  = 0;
 
-    if (state == STATE_LIBRARY) {
-        int visibleRows = (SCREEN_H - MARGIN_Y - FOOTER_H) / LIB_LINE_H;
-        if (x[0] < LEFT_ZONE) {
-            if (selectedIdx > 0) {
-                selectedIdx--;
-                if (selectedIdx < scrollOffset) scrollOffset = selectedIdx;
-                drawLibrary();
-            }
-        } else if (x[0] > RIGHT_ZONE) {
-            if (selectedIdx < bookCount - 1) {
-                selectedIdx++;
-                if (selectedIdx >= scrollOffset + visibleRows)
-                    scrollOffset = selectedIdx - visibleRows + 1;
-                drawLibrary();
-            }
-        } else {
-            // Centre: open selected book
-            if (bookCount > 0)
-                openBook(bookNames[selectedIdx]);
-        }
+void handleGesture(int dx, int dy, uint16_t sx) {
+    int adx = abs(dx), ady = abs(dy);
 
-    } else if (state == STATE_READING) {
-        if (x[0] < LEFT_ZONE) {
-            // Prev page
-            if (currentPage > 0) {
-                currentPage--;
-                drawPage(false);
-            }
-        } else if (x[0] > RIGHT_ZONE) {
-            // Next page
-            if (currentPage < pageCount - 1) {
-                currentPage++;
-                drawPage(false);
-            } else {
-                // End of book → back to library
+    if (ady > SWIPE_THRESHOLD && ady > adx) {
+        // ── Vertical swipe ─────────────────────────────────────────────────
+        if (dy < 0) {
+            // Swipe UP → back to library from anywhere
+            if (state == STATE_READING) {
                 if (bookFile.isOpen()) bookFile.close();
                 state = STATE_LIBRARY;
                 drawLibrary();
             }
         }
-        // Centre zone ignored in reading state
+        // Swipe DOWN reserved for future menu
+    } else if (adx < TAP_MAX_DRIFT && ady < TAP_MAX_DRIFT) {
+        // ── Tap ────────────────────────────────────────────────────────────
+        if (state == STATE_LIBRARY) {
+            int visibleRows = (SCREEN_H - MARGIN_Y - FOOTER_H) / LIB_LINE_H;
+            if (sx < LEFT_ZONE) {
+                if (selectedIdx > 0) {
+                    selectedIdx--;
+                    if (selectedIdx < scrollOffset) scrollOffset = selectedIdx;
+                    drawLibrary();
+                }
+            } else if (sx > RIGHT_ZONE) {
+                if (selectedIdx < bookCount - 1) {
+                    selectedIdx++;
+                    if (selectedIdx >= scrollOffset + visibleRows)
+                        scrollOffset = selectedIdx - visibleRows + 1;
+                    drawLibrary();
+                }
+            } else {
+                if (bookCount > 0) openBook(bookNames[selectedIdx]);
+            }
+
+        } else if (state == STATE_READING) {
+            if (sx < LEFT_ZONE) {
+                if (currentPage > 0) { currentPage--; drawPage(false); }
+            } else if (sx > RIGHT_ZONE) {
+                if (currentPage < pageCount - 1) {
+                    currentPage++;
+                    drawPage(false);
+                } else {
+                    if (bookFile.isOpen()) bookFile.close();
+                    state = STATE_LIBRARY;
+                    drawLibrary();
+                }
+            }
+        }
     }
+}
+
+void loop() {
+    unsigned long now = millis();
+
+    if (!inkplate.tsAvailable()) { delay(10); return; }
+
+    uint16_t x[2], y[2];
+    uint8_t n = inkplate.tsGetData(x, y);
+
+    if (n > 0) {
+        if (!touchActive) {
+            touchActive = true;
+            touchStartX = x[0]; touchStartY = y[0];
+        }
+        touchLastX = x[0]; touchLastY = y[0];
+    } else if (touchActive) {
+        touchActive = false;
+        // Gesture complete — only act if cooldown has passed
+        if (now - lastActionMs >= POST_ACTION_MS) {
+            int dx = (int)touchLastX - (int)touchStartX;
+            int dy = (int)touchLastY - (int)touchStartY;
+            handleGesture(dx, dy, touchStartX);
+        }
+    }
+
+    delay(10);
 }
