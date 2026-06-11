@@ -42,7 +42,8 @@ int  scrollOffset = 0;
 uint32_t pageOffsets[MAX_PAGES];
 int      pageCount     = 0;
 int      currentPage   = 0;
-int      partialCount  = 0;   // partial refreshes since last full
+int      partialCount    = 0;  // partial refreshes since last full (reading)
+int      libPartialCount = 0;  // partial refreshes since last full (library)
 char     openBookName[64];
 SdFile   bookFile;
 
@@ -269,7 +270,7 @@ void drawFooter(const char* title, int page, int total) {
     inkplate.print(buf);
 }
 
-void drawLibrary() {
+void drawLibrary(bool forceFullRefresh = true) {
     inkplate.clearDisplay();
     inkplate.setFont(NULL);
     inkplate.setTextSize(2);
@@ -307,7 +308,18 @@ void drawLibrary() {
              bookCount, bookCount == 1 ? "" : "s");
     inkplate.print(footer);
 
-    inkplate.display();
+    if (forceFullRefresh) {
+        inkplate.display();
+        libPartialCount = 0;
+    } else {
+        libPartialCount++;
+        if (libPartialCount >= FULL_REFRESH_N) {
+            inkplate.display();
+            libPartialCount = 0;
+        } else {
+            inkplate.partialUpdate();
+        }
+    }
     lastActionMs = millis();
 }
 
@@ -430,14 +442,14 @@ void handleGesture(int dx, int dy, uint16_t sx) {
                 if (selectedIdx > 0) {
                     selectedIdx--;
                     if (selectedIdx < scrollOffset) scrollOffset = selectedIdx;
-                    drawLibrary();
+                    drawLibrary(false);
                 }
             } else if (sx > RIGHT_ZONE) {
                 if (selectedIdx < bookCount - 1) {
                     selectedIdx++;
                     if (selectedIdx >= scrollOffset + visibleRows)
                         scrollOffset = selectedIdx - visibleRows + 1;
-                    drawLibrary();
+                    drawLibrary(false);
                 }
             } else {
                 if (bookCount > 0) openBook(bookNames[selectedIdx]);
